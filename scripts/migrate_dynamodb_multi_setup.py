@@ -16,10 +16,14 @@ What this does
 
 Environment (same as bot): AWS_REGION, CLIENT_ID, DEFAULT_TABLE, OVERRIDE_TABLE.
 
+**AWS_REGION** — must match the region where your DynamoDB tables live.
+Production stacks commonly use **`AWS_REGION=ap-east-1`** (Asia Pacific — Hong Kong).
+If unset, this script defaults to **ap-south-1** (same fallback pattern as `sell.py`).
+
 Usage
 -----
-  python scripts/migrate_dynamodb_multi_setup.py --dry-run
-  python scripts/migrate_dynamodb_multi_setup.py --defaults --overrides --trades
+  AWS_REGION=ap-east-1 python scripts/migrate_dynamodb_multi_setup.py --dry-run
+  AWS_REGION=ap-east-1 python scripts/migrate_dynamodb_multi_setup.py --defaults --overrides --trades
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Match region to your tables (see module docstring: e.g. AWS_REGION=ap-east-1).
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 CLIENT_ID = os.getenv("CLIENT_ID")
 DEFAULT_TABLE = os.getenv("DEFAULT_TABLE", "DefaultAlgoConfig")
@@ -189,7 +194,11 @@ def _migrate_trades_table(
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Tip: point boto3 at Hong Kong with AWS_REGION=ap-east-1 before running.",
+    )
     p.add_argument("--dry-run", action="store_true", help="Log actions only")
     p.add_argument("--defaults", action="store_true", help="Migrate DefaultAlgoConfig")
     p.add_argument("--overrides", action="store_true", help="Migrate ClientAlgoConfig")
