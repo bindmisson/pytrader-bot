@@ -1,0 +1,84 @@
+# Reference DynamoDB layout used by sell.py (multi-setup bot).
+# Existing production stacks may already define these tables — use as documentation
+# or bootstrap for new environments only.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DynamoDB tables for OpenAlgo execution bot — DefaultAlgoConfig (global defaults),
+  ClientAlgoConfig (per-client overrides), ClientTrades (positions / PnL snapshots),
+  ExchangeHolidays (holiday calendar scans).
+
+Resources:
+  DefaultAlgoConfig:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: DefaultAlgoConfig
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: index_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: index_name
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ClientAlgoConfig:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ClientAlgoConfig
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: client_id
+          AttributeType: S
+        - AttributeName: index_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: client_id
+          KeyType: HASH
+        - AttributeName: index_name
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ClientTrades:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ClientTrades
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: client_id
+          AttributeType: S
+        - AttributeName: trade_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: client_id
+          KeyType: HASH
+        - AttributeName: trade_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ExchangeHolidays:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ExchangeHolidays
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: holiday_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: holiday_date
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+Outputs:
+  DefaultAlgoConfigTable:
+    Value: !Ref DefaultAlgoConfig
+  ClientAlgoConfigTable:
+    Value: !Ref ClientAlgoConfig
+  ClientTradesTable:
+    Value: !Ref ClientTrades
+  ExchangeHolidaysTable:
+    Value: !Ref ExchangeHolidays

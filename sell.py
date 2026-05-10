@@ -3,22 +3,23 @@
 # ============================================================
 
 from fastapi import FastAPI, Request, HTTPException
-import uvicorn, os, json, logging, asyncio, math, time
-from datetime import datetime, timedelta, time as dt_time
+import uvicorn
+import os
+import json
+import logging
+import asyncio
+import math
 import time
+from datetime import datetime, timedelta, time as dt_time
 from decimal import Decimal
 from collections import defaultdict
+from contextlib import asynccontextmanager
 
 import boto3
 from boto3.dynamodb.conditions import Key
 from dotenv import load_dotenv
 from openalgo import api
 import pytz
-from decimal import Decimal
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-import asyncio
-import math
 
 
 print("🚀 Execution Bot Running — Production SaaS Mode")
@@ -37,27 +38,96 @@ if not CLIENT_ID:
     raise ValueError("CLIENT_ID missing")
 
 # ============================================================
-# LOCAL FAILOVER CONFIG
+# INDEX / EXCHANGE / LOT MAPS (MULTI-INDEX)
 # ============================================================
+INDEX_EXCHANGE_MAP = {
+    "NIFTY": "NSE_INDEX",
+    "BANKNIFTY": "NSE_INDEX",
+    "FINNIFTY": "NSE_INDEX",
+    "MIDCPNIFTY": "NSE_INDEX",
+    "NIFTYNXT50": "NSE_INDEX",
+    "SENSEX": "BSE_INDEX",
+    "BANKEX": "BSE_INDEX",
+}
+
+ORDER_EXCHANGE_MAP = {
+    "NIFTY": "NFO",
+    "BANKNIFTY": "NFO",
+    "FINNIFTY": "NFO",
+    "MIDCPNIFTY": "NFO",
+    "NIFTYNXT50": "NFO",
+    "SENSEX": "BFO",
+    "BANKEX": "BFO",
+}
+
+STRIKE_INTERVAL_MAP = {
+    "NIFTY": 50,
+    "BANKNIFTY": 100,
+    "FINNIFTY": 50,
+    "MIDCPNIFTY": 25,
+    "NIFTYNXT50": 50,
+    "SENSEX": 100,
+    "BANKEX": 100,
+}
+
+LOT_SIZE_MAP = {
+    "SENSEX": 20,
+    "NIFTY": 65,
+    "FINNIFTY": 60,
+    "BANKNIFTY": 30,
+    "MIDCPNIFTY": 120,
+    "NIFTYNXT50": 25,
+    "BANKEX": 30,
+}
+
+LOT_SIZES = LOT_SIZE_MAP
+
+# ============================================================
+# LOCAL FAILOVER CONFIG (MULTI-SETUP)
+# ============================================================
+_LOCAL_SETUP_DEFAULT = {
+    "name": "DEFAULT",
+    "enabled": True,
+    "buy_enabled": True,
+    "buy_lots": 1,
+    "buy_shift_ce": 0,
+    "buy_shift_pe": 0,
+    "buy_fixed_exit_enabled": True,
+    "buy_fixed_premium_points": 60,
+    "buy_fixed_sl_enabled": False,
+    "buy_sl_premium_points": 100,
+    "buy_percent_exit_enabled": True,
+    "buy_percent_sl_enabled": False,
+    "buy_target_percent": 120,
+    "buy_stoploss_percent": 60,
+    "sell_enabled": True,
+    "sell_lots": 1,
+    "sell_shift": 100,
+    "sell_shift_ce": 100,
+    "sell_shift_pe": 100,
+    "hedge_distance": 500,
+    "hedge_distance_ce": 500,
+    "hedge_distance_pe": 500,
+    "sell_fixed_exit_enabled": True,
+    "sell_fixed_premium_points": 60,
+    "sell_fixed_sl_enabled": False,
+    "sell_sl_premium_points": 100,
+    "sell_percent_exit_enabled": True,
+    "sell_percent_sl_enabled": False,
+    "sell_target_percent": 80,
+    "sell_stoploss_percent": 50,
+}
+
 LOCAL_DEFAULT = {
-    "NIFTY":{
+    "NIFTY": {
+        "index_name": "NIFTY",
         "enabled": True,
-        "buy_lots": 1,
-        "sell_lots": 1,
-        "buy_enabled": True,
-        "sell_enabled": True,
-        "exchange": "NFO",
-        "strike_interval": 50,
-        "sell_shift": 100,
-        "sell_shift_ce": 100,
-        "sell_shift_pe": 100,
-        "hedge_distance": 500,
-        "hedge_distance_ce": 500,
-        "hedge_distance_pe": 500,
-        "buy_fixed_premium_points": 60,
-        "sell_fixed_premium_points": 60,
-        "buy_shift_ce": 0,
-        "buy_shift_pe": 0
+        "exchange": ORDER_EXCHANGE_MAP["NIFTY"],
+        "index_exchange": INDEX_EXCHANGE_MAP["NIFTY"],
+        "strike_interval": STRIKE_INTERVAL_MAP["NIFTY"],
+        "vix_threshold": 30,
+        "expiry": None,
+        "setups": [{**_LOCAL_SETUP_DEFAULT}],
     }
 }
 
@@ -131,285 +201,408 @@ def to_number(v):
 
 
 # ============================================================
-# LOAD CONFIG (WITH VALIDATION)
+# RUNTIME / STATE KEYS (SETUP-AWARE)
+# ============================================================
+def runtime_key(index: str, setup_name: str) -> str:
+    return f"{index}_{setup_name}"
+
+
+def state_file(index: str, setup_name: str) -> str:
+    return f"state/{index}_{setup_name}.json"
+
+
+def merged_exec_context(index_cfg: dict, setup: dict) -> dict:
+    ctx = {**setup}
+    ctx["exchange"] = index_cfg["exchange"]
+    ctx["strike_interval"] = index_cfg["strike_interval"]
+    return ctx
+
+
+def resolve_sell_expiry(index: str, index_cfg: dict) -> str:
+    exp = index_cfg.get("expiry") if index_cfg else None
+    if exp:
+        return str(exp).upper().strip()
+    return get_expiry(index)
+
+
+def get_setup_by_name(index_cfg: dict, setup_name: str):
+    for s in index_cfg.get("setups", []):
+        if s.get("name") == setup_name:
+            return s
+    return None
+
+
+def iter_index_setup_pairs(cfg_map: dict):
+    for idx, index_cfg in cfg_map.items():
+        for setup in index_cfg.get("setups", []):
+            if setup.get("enabled", True):
+                yield idx, setup.get("name", "DEFAULT"), index_cfg, setup
+
+
+# ============================================================
+# SETUP NORMALIZATION (MULTI-SETUP + LEGACY FLAT ROWS)
+# ============================================================
+def _normalize_setup(s: dict, fallback_name: str = "DEFAULT") -> dict:
+
+    name = str(s.get("name", fallback_name))
+
+    base = {
+        "name": name,
+        "enabled": s.get("enabled", True),
+        "buy_enabled": s.get("buy_enabled", True),
+        "buy_lots": to_int(s.get("buy_lots", 1)),
+        "buy_shift_ce": to_int(s.get("buy_shift_ce", 0)),
+        "buy_shift_pe": to_int(s.get("buy_shift_pe", 0)),
+        "buy_fixed_exit_enabled": s.get("buy_fixed_exit_enabled", True),
+        "buy_fixed_premium_points": to_number(s.get("buy_fixed_premium_points", 100)),
+        "buy_fixed_sl_enabled": s.get("buy_fixed_sl_enabled", False),
+        "buy_sl_premium_points": to_number(s.get("buy_sl_premium_points", 100)),
+        "buy_percent_exit_enabled": s.get("buy_percent_exit_enabled", True),
+        "buy_percent_sl_enabled": s.get("buy_percent_sl_enabled", False),
+        "buy_target_percent": to_number(s.get("buy_target_percent", 120)),
+        "buy_stoploss_percent": to_number(s.get("buy_stoploss_percent", 60)),
+        "sell_enabled": s.get("sell_enabled", True),
+        "sell_lots": to_int(s.get("sell_lots", 1)),
+        "sell_shift": to_int(s.get("sell_shift", s.get("sell_shift_ce", 100))),
+        "sell_shift_ce": to_int(s.get("sell_shift_ce", s.get("sell_shift", 100))),
+        "sell_shift_pe": to_int(s.get("sell_shift_pe", s.get("sell_shift", 100))),
+        "hedge_distance": to_int(
+            s.get("hedge_distance", s.get("hedge_distance_ce", 500))
+        ),
+        "hedge_distance_ce": to_int(
+            s.get("hedge_distance_ce", s.get("hedge_distance", 500))
+        ),
+        "hedge_distance_pe": to_int(
+            s.get("hedge_distance_pe", s.get("hedge_distance", 500))
+        ),
+        "sell_fixed_exit_enabled": s.get("sell_fixed_exit_enabled", True),
+        "sell_fixed_premium_points": to_number(s.get("sell_fixed_premium_points", 100)),
+        "sell_fixed_sl_enabled": s.get("sell_fixed_sl_enabled", False),
+        "sell_sl_premium_points": to_number(s.get("sell_sl_premium_points", 100)),
+        "sell_percent_exit_enabled": s.get("sell_percent_exit_enabled", True),
+        "sell_percent_sl_enabled": s.get("sell_percent_sl_enabled", False),
+        "sell_target_percent": to_number(s.get("sell_target_percent", 80)),
+        "sell_stoploss_percent": to_number(s.get("sell_stoploss_percent", 50)),
+    }
+
+    return base
+
+
+def _legacy_flat_row_to_setup(item: dict) -> dict:
+    return _normalize_setup(
+        {
+            "name": "DEFAULT",
+            "enabled": item.get("enabled", True),
+            "buy_enabled": item.get("buy_enabled", True),
+            "buy_lots": item.get("buy_lots", 1),
+            "sell_lots": item.get("sell_lots", 1),
+            "sell_shift": item.get("sell_shift", 100),
+            "sell_shift_ce": item.get("sell_shift_ce", item.get("sell_shift", 100)),
+            "sell_shift_pe": item.get("sell_shift_pe", item.get("sell_shift", 100)),
+            "buy_shift_ce": item.get("buy_shift_ce", 0),
+            "buy_shift_pe": item.get("buy_shift_pe", 0),
+            "hedge_distance": item.get("hedge_distance", 500),
+            "hedge_distance_ce": item.get(
+                "hedge_distance_ce", item.get("hedge_distance", 500)
+            ),
+            "hedge_distance_pe": item.get(
+                "hedge_distance_pe", item.get("hedge_distance", 500)
+            ),
+            "buy_fixed_exit_enabled": item.get("buy_fixed_exit_enabled", True),
+            "buy_fixed_premium_points": item.get("buy_fixed_premium_points", 100),
+            "buy_fixed_sl_enabled": item.get("buy_fixed_sl_enabled", False),
+            "buy_sl_premium_points": item.get("buy_sl_premium_points", 100),
+            "buy_percent_exit_enabled": item.get("buy_percent_exit_enabled", True),
+            "buy_percent_sl_enabled": item.get("buy_percent_sl_enabled", False),
+            "buy_target_percent": item.get("buy_target_percent", 120),
+            "buy_stoploss_percent": item.get("buy_stoploss_percent", 60),
+            "sell_enabled": item.get("sell_enabled", True),
+            "sell_fixed_exit_enabled": item.get("sell_fixed_exit_enabled", True),
+            "sell_fixed_premium_points": item.get("sell_fixed_premium_points", 100),
+            "sell_fixed_sl_enabled": item.get("sell_fixed_sl_enabled", False),
+            "sell_sl_premium_points": item.get("sell_sl_premium_points", 100),
+            "sell_percent_exit_enabled": item.get("sell_percent_exit_enabled", True),
+            "sell_percent_sl_enabled": item.get("sell_percent_sl_enabled", False),
+            "sell_target_percent": item.get("sell_target_percent", 80),
+            "sell_stoploss_percent": item.get("sell_stoploss_percent", 50),
+        },
+        fallback_name="DEFAULT",
+    )
+
+
+def _apply_flat_numeric_override_to_setup(merged: dict, ov: dict, idx: str, interval: int, base_setup: dict):
+
+    for k in [
+        "buy_lots",
+        "sell_lots",
+        "buy_fixed_premium_points",
+        "sell_fixed_premium_points",
+        "buy_target_percent",
+        "sell_target_percent",
+        "buy_stoploss_percent",
+        "sell_stoploss_percent",
+        "buy_sl_premium_points",
+        "sell_sl_premium_points",
+        "buy_percent_exit_enabled",
+        "buy_fixed_exit_enabled",
+        "buy_percent_sl_enabled",
+        "buy_fixed_sl_enabled",
+        "sell_percent_exit_enabled",
+        "sell_fixed_exit_enabled",
+        "sell_percent_sl_enabled",
+        "sell_fixed_sl_enabled",
+        "sell_shift_ce",
+        "sell_shift_pe",
+        "buy_shift_ce",
+        "buy_shift_pe",
+    ]:
+        if k in ov:
+            merged[k] = to_number(ov[k])
+
+    merged["buy_enabled"] = ov.get("buy_enabled", merged["buy_enabled"])
+    merged["sell_enabled"] = ov.get("sell_enabled", merged["sell_enabled"])
+    merged["enabled"] = ov.get("enabled", merged.get("enabled", True))
+
+    if "sell_shift" in ov:
+        client_shift = to_int(ov["sell_shift"])
+        if client_shift % interval != 0:
+            logging.error(
+                f"{CLIENT_ID}-{idx} INVALID sell_shift {client_shift} "
+                f"not multiple of {interval} → default {base_setup['sell_shift']} used"
+            )
+        else:
+            merged["sell_shift"] = client_shift
+            logging.info(f"{CLIENT_ID}-{idx} sell_shift overridden → {client_shift}")
+
+    if "sell_shift_ce" in ov:
+        client_shift = to_int(ov["sell_shift_ce"])
+        if abs(client_shift) % interval != 0:
+            logging.error(f"{CLIENT_ID}-{idx} INVALID sell_shift_ce {client_shift}")
+        else:
+            merged["sell_shift_ce"] = client_shift
+
+    if "sell_shift_pe" in ov:
+        client_shift = to_int(ov["sell_shift_pe"])
+        if abs(client_shift) % interval != 0:
+            logging.error(f"{CLIENT_ID}-{idx} INVALID sell_shift_pe {client_shift}")
+        else:
+            merged["sell_shift_pe"] = client_shift
+
+    if "buy_shift_ce" in ov:
+        client_shift = to_int(ov["buy_shift_ce"])
+        if abs(client_shift) % interval != 0:
+            logging.error(
+                f"{CLIENT_ID}-{idx} INVALID buy_shift_ce {client_shift} "
+                f"not multiple of {interval} → default used"
+            )
+        else:
+            merged["buy_shift_ce"] = client_shift
+            logging.info(f"{CLIENT_ID}-{idx} buy_shift_ce overridden → {client_shift}")
+
+    if "buy_shift_pe" in ov:
+        client_shift = to_int(ov["buy_shift_pe"])
+        if abs(client_shift) % interval != 0:
+            logging.error(
+                f"{CLIENT_ID}-{idx} INVALID buy_shift_pe {client_shift} "
+                f"not multiple of {interval} → default used"
+            )
+        else:
+            merged["buy_shift_pe"] = client_shift
+            logging.info(f"{CLIENT_ID}-{idx} buy_shift_pe overridden → {client_shift}")
+
+    if "hedge_distance" in ov:
+        client_hedge = to_int(ov["hedge_distance"])
+        if client_hedge % interval != 0:
+            logging.error(
+                f"{CLIENT_ID}-{idx} INVALID hedge_distance {client_hedge} "
+                f"not multiple of {interval} → default {base_setup['hedge_distance']} used"
+            )
+        elif client_hedge <= merged["sell_shift"]:
+            logging.error(
+                f"{CLIENT_ID}-{idx} INVALID hedge_distance {client_hedge} "
+                f"<= sell_shift {merged['sell_shift']} → default used"
+            )
+        else:
+            merged["hedge_distance"] = client_hedge
+            logging.info(f"{CLIENT_ID}-{idx} hedge_distance overridden → {client_hedge}")
+
+    if "hedge_distance_ce" in ov:
+        val = to_int(ov["hedge_distance_ce"])
+        if abs(val) % interval != 0:
+            logging.error(f"INVALID hedge_distance_ce {val}")
+        elif val <= abs(merged.get("sell_shift_ce", merged.get("sell_shift", 100))):
+            logging.error("hedge_distance_ce too small")
+        else:
+            merged["hedge_distance_ce"] = val
+
+    if "hedge_distance_pe" in ov:
+        val = to_int(ov["hedge_distance_pe"])
+        if abs(val) % interval != 0:
+            logging.error(f"INVALID hedge_distance_pe {val}")
+        elif val <= abs(merged.get("sell_shift_pe", merged.get("sell_shift", 100))):
+            logging.error("hedge_distance_pe too small")
+        else:
+            merged["hedge_distance_pe"] = val
+
+
+def _default_index_skeleton(idx: str, src: dict) -> dict:
+    return {
+        "index_name": idx,
+        "enabled": src.get("enabled", False),
+        "exchange": ORDER_EXCHANGE_MAP.get(idx, src.get("exchange", "NFO")),
+        "index_exchange": INDEX_EXCHANGE_MAP.get(idx, "NSE_INDEX"),
+        "strike_interval": to_int(
+            src.get("strike_interval", STRIKE_INTERVAL_MAP.get(idx, 50))
+        ),
+        "vix_threshold": to_number(src.get("vix_threshold", 30)),
+        "expiry": src.get("expiry"),
+        "setups": [],
+    }
+
+
+def _parse_setups_from_dynamo_item(item: dict) -> list:
+    if "setups" not in item:
+        return [_legacy_flat_row_to_setup(item)]
+
+    raw = item.get("setups") or []
+    out = []
+    for j, s in enumerate(raw):
+        if isinstance(s, dict):
+            out.append(_normalize_setup(s, fallback_name=s.get("name", f"SETUP{j}")))
+    return out
+
+
+def _merge_setup_dict(base: dict, ov: dict, idx: str, interval: int) -> dict:
+    merged = dict(base)
+    _apply_flat_numeric_override_to_setup(merged, ov, idx, interval, base)
+    if isinstance(ov, dict) and ov.get("name"):
+        merged["name"] = str(ov["name"])
+    return merged
+
+
+# ============================================================
+# LOAD CONFIG (WITH VALIDATION) — MULTI-SETUP
 # ============================================================
 def load_indices_config():
 
-    global CONFIG_CACHE,LAST_LOAD
+    global CONFIG_CACHE, LAST_LOAD
 
-    if time.time()-LAST_LOAD<CACHE_TTL:
+    if time.time() - LAST_LOAD < CACHE_TTL:
         return CONFIG_CACHE
 
     try:
 
-        # ---------- DEFAULTS ----------
-        resp=default_table.scan()
-        defaults={}
+        resp = default_table.scan()
+        defaults = {}
 
-        for i in resp.get("Items",[]):
+        for i in resp.get("Items", []):
+            idx = i["index_name"]
+            skel = _default_index_skeleton(idx, i)
+            skel["setups"] = _parse_setups_from_dynamo_item(i)
+            if not i.get("setups"):
+                skel["enabled"] = i.get("enabled", False)
+            defaults[idx] = skel
 
-            defaults[i["index_name"]] = {
-                "enabled": i.get("enabled",False),
-                "buy_lots": to_int(i.get("buy_lots",1)),
-                "sell_lots": to_int(i.get("sell_lots",1)),
-                "exchange": i.get("exchange","NFO"),
-                "strike_interval": to_int(i.get("strike_interval",50)),
-                "sell_shift": to_int(i.get("sell_shift",100)),
-                "sell_shift_ce": to_int(i.get("sell_shift_ce", i.get("sell_shift", 100))),
-                "sell_shift_pe": to_int(i.get("sell_shift_pe", i.get("sell_shift", 100))),
-                "buy_shift_ce": to_int(i.get("buy_shift_ce", 0)),
-                "buy_shift_pe": to_int(i.get("buy_shift_pe", 0)),
-                "hedge_distance": to_int(i.get("hedge_distance",500)),
-                "hedge_distance_ce": to_int(i.get("hedge_distance_ce", i.get("hedge_distance", 500))),
-                "hedge_distance_pe": to_int(i.get("hedge_distance_pe", i.get("hedge_distance", 500))),
-		"buy_enabled": i.get("buy_enabled", True),
-    		"buy_fixed_exit_enabled": i.get("buy_fixed_exit_enabled", True),
-    		"buy_fixed_premium_points": to_number(i.get("buy_fixed_premium_points", 100)),
-    		"buy_fixed_sl_enabled": i.get("buy_fixed_sl_enabled", False),
-    		"buy_sl_premium_points": to_number(i.get("buy_sl_premium_points", 100)),
-    		"buy_percent_exit_enabled": i.get("buy_percent_exit_enabled", True),
-    		"buy_percent_sl_enabled": i.get("buy_percent_sl_enabled", False),
-    		"buy_target_percent": to_number(i.get("buy_target_percent", 120)),
-    		"buy_stoploss_percent": to_number(i.get("buy_stoploss_percent", 60)),
-    		"sell_enabled": i.get("sell_enabled", True),
-    		"sell_fixed_exit_enabled": i.get("sell_fixed_exit_enabled", True),
-    		"sell_fixed_premium_points": to_number(i.get("sell_fixed_premium_points", 100)),
-    		"sell_fixed_sl_enabled": i.get("sell_fixed_sl_enabled", False),
-    		"sell_sl_premium_points": to_number(i.get("sell_sl_premium_points", 100)),
-    		"sell_percent_exit_enabled": i.get("sell_percent_exit_enabled", True),
-    		"sell_percent_sl_enabled": i.get("sell_percent_sl_enabled", False),
-    		"sell_target_percent": to_number(i.get("sell_target_percent", 80)),
-    		"sell_stoploss_percent": to_number(i.get("sell_stoploss_percent", 50)),
-
-            }
-
-        # ---------- OVERRIDES ----------
-        resp2=override_table.query(
+        resp2 = override_table.query(
             KeyConditionExpression=Key("client_id").eq(CLIENT_ID)
         )
 
-        overrides={}
-        disabled=set()
+        overrides = {}
+        disabled = set()
 
-        for i in resp2.get("Items",[]):
-
-            idx=i["index_name"]
-
-            if not i.get("approved",False):
+        for i in resp2.get("Items", []):
+            idx = i["index_name"]
+            if not i.get("approved", False):
                 disabled.add(idx)
                 continue
+            overrides[idx] = i
 
-            overrides[idx]=i
-
-        # ---------- MERGE + VALIDATE ----------
         final = {}
 
-        for idx, base in defaults.items():
+        for idx, index_cfg in defaults.items():
 
             if idx in disabled:
                 continue
 
-            merged = base.copy()
-            interval = merged["strike_interval"]
-            if idx in overrides:
+            merged_index = dict(index_cfg)
+            interval = merged_index["strike_interval"]
 
+            if idx in overrides:
                 ov = overrides[idx]
 
-                # ---------------- BASIC OVERRIDES ----------------
-                # ---------------- BASIC OVERRIDES ----------------
+                if "enabled" in ov:
+                    merged_index["enabled"] = ov["enabled"]
 
-                # Numeric / string fields
-                for k in [
-                    "enabled",
-                    "buy_lots",
-                    "sell_lots",
-                    "exchange",
-                    "strike_interval",
-                    "buy_fixed_premium_points",
-                    "sell_fixed_premium_points",
-                    "buy_target_percent",
-                    "sell_target_percent",
-                    "buy_stoploss_percent",
-                    "sell_stoploss_percent",
-                    "buy_sl_premium_points",
-                    "sell_sl_premium_points",
-                    "buy_percent_exit_enabled",
-                    "buy_fixed_exit_enabled",
-                    "buy_percent_sl_enabled",
-                    "buy_fixed_sl_enabled",
-                    "sell_percent_exit_enabled",
-                    "sell_fixed_exit_enabled",
-                    "sell_percent_sl_enabled",
-                    "sell_fixed_sl_enabled",
-                    "vix_threshold",
-                    "sell_shift_ce",
-                    "sell_shift_pe",
-                    "buy_shift_ce",
-                    "buy_shift_pe"
-                ]:
-                    if k in ov:
-                        merged[k] = to_number(ov[k]) if k != "exchange" else ov[k]
+                if "exchange" in ov:
+                    merged_index["exchange"] = ov["exchange"]
 
+                if "strike_interval" in ov:
+                    merged_index["strike_interval"] = to_int(ov["strike_interval"])
+                    interval = merged_index["strike_interval"]
 
-                # ====================================================
-                # 🟢 STRATEGY ENABLE FLAGS (ADD / FIX HERE)
-                # ====================================================
+                if "vix_threshold" in ov:
+                    merged_index["vix_threshold"] = to_number(ov["vix_threshold"])
 
-                merged["buy_enabled"]  = ov.get("buy_enabled", True)    
-                merged["sell_enabled"] = ov.get("sell_enabled", True)
+                if "expiry" in ov:
+                    merged_index["expiry"] = ov["expiry"]
 
-                # SELL SHIFT VALIDATION
-                if "sell_shift" in ov:
+                ov_setups_raw = ov.get("setups")
 
-                    client_shift = to_int(ov["sell_shift"])
+                if ov_setups_raw:
+                    by_name = {}
+                    for s in ov_setups_raw:
+                        if isinstance(s, dict) and s.get("name"):
+                            by_name[str(s["name"])] = s
 
-                    if client_shift % interval != 0:
+                    new_list = []
+                    for s in merged_index["setups"]:
+                        nm = s["name"]
+                        if nm in by_name:
+                            new_list.append(
+                                _merge_setup_dict(s, by_name[nm], idx, interval)
+                            )
+                        else:
+                            new_list.append(dict(s))
 
-                        logging.error(
-                            f"{CLIENT_ID}-{idx} INVALID sell_shift {client_shift} "
-                            f"not multiple of {interval} → default {base['sell_shift']} used"
+                    for nm, patch in by_name.items():
+                        if not any(x["name"] == nm for x in new_list):
+                            new_list.append(
+                                _normalize_setup(patch, fallback_name=nm)
+                            )
+
+                    merged_index["setups"] = new_list
+
+                else:
+
+                    target = None
+                    for s in merged_index["setups"]:
+                        if s["name"] == "DEFAULT":
+                            target = s
+                            break
+                    if target is None and merged_index["setups"]:
+                        target = merged_index["setups"][0]
+
+                    if target is not None:
+                        ti = merged_index["setups"].index(target)
+                        merged_index["setups"][ti] = dict(target)
+                        _apply_flat_numeric_override_to_setup(
+                            merged_index["setups"][ti], ov, idx, interval, target
                         )
 
-                    else:
-                        merged["sell_shift"] = client_shift
-
-                        logging.info(
-                            f"{CLIENT_ID}-{idx} sell_shift overridden → {client_shift}"
-                        )
-
-                # ====================================================
-                # SELL SHIFT CE VALIDATION
-                # ====================================================
-                if "sell_shift_ce" in ov:
-
-                    client_shift = to_int(ov["sell_shift_ce"])
-
-                    if abs(client_shift) % interval != 0:
-                        logging.error(
-                            f"{CLIENT_ID}-{idx} INVALID sell_shift_ce {client_shift}"
-                        )
-                    else:
-                        merged["sell_shift_ce"] = client_shift
-
-                # ====================================================
-                # SELL SHIFT PE VALIDATION
-                # ====================================================
-                if "sell_shift_pe" in ov:
-
-                    client_shift = to_int(ov["sell_shift_pe"])
-
-                    if abs(client_shift) % interval != 0:
-                        logging.error(
-                            f"{CLIENT_ID}-{idx} INVALID sell_shift_pe {client_shift}"
-                        )
-                    else:
-                        merged["sell_shift_pe"] = client_shift
-
-
-
-                # ====================================================
-                # BUY SHIFT CE VALIDATION
-                # ====================================================
-                if "buy_shift_ce" in ov:
-
-                    client_shift = to_int(ov["buy_shift_ce"])
-
-                    if abs(client_shift) % interval != 0:
-                        logging.error(
-                            f"{CLIENT_ID}-{idx} INVALID buy_shift_ce {client_shift} "
-                            f"not multiple of {interval} → default used"
-                        )
-                    else:
-                        merged["buy_shift_ce"] = client_shift
-
-                        logging.info(
-                            f"{CLIENT_ID}-{idx} buy_shift_ce overridden → {client_shift}"
-                        )
-
-                # ====================================================
-                # BUY SHIFT PE VALIDATION
-                # ====================================================
-                if "buy_shift_pe" in ov:
-
-                    client_shift = to_int(ov["buy_shift_pe"])
-
-                    if abs(client_shift) % interval != 0:
-                        logging.error(
-                            f"{CLIENT_ID}-{idx} INVALID buy_shift_pe {client_shift} "
-                            f"not multiple of {interval} → default used"
-                        )
-                    else:
-                        merged["buy_shift_pe"] = client_shift
-
-                        logging.info(
-                            f"{CLIENT_ID}-{idx} buy_shift_pe overridden → {client_shift}"
-                        )
-
-
-                # HEDGE DISTANCE VALIDATION
-                if "hedge_distance" in ov:
-
-                    client_hedge = to_int(ov["hedge_distance"])
-
-                    if client_hedge % interval != 0:
-
-                        logging.error(
-                            f"{CLIENT_ID}-{idx} INVALID hedge_distance {client_hedge} "
-                            f"not multiple of {interval} → default {base['hedge_distance']} used"
-                        )
-
-                    elif client_hedge <= merged["sell_shift"]:
-
-                        logging.error(
-                            f"{CLIENT_ID}-{idx} INVALID hedge_distance {client_hedge} "
-                            f"<= sell_shift {merged['sell_shift']} → default used"
-                        )
-
-                    else:
-                        merged["hedge_distance"] = client_hedge
-
-                        logging.info(
-                            f"{CLIENT_ID}-{idx} hedge_distance overridden → {client_hedge}"
-                        )
-
-                # CE
-                if "hedge_distance_ce" in ov:
-
-                    val = to_int(ov["hedge_distance_ce"])
-
-                    if abs(val) % interval != 0:
-                        logging.error(f"INVALID hedge_distance_ce {val}")
-
-                    elif val <= abs(merged.get("sell_shift_ce", merged.get("sell_shift", 100))):
-                        logging.error(f"hedge_distance_ce too small")
-
-                    else:
-                        merged["hedge_distance_ce"] = val
-
-
-                # PE
-                if "hedge_distance_pe" in ov:
-
-                    val = to_int(ov["hedge_distance_pe"])
-
-                    if abs(val) % interval != 0:
-                        logging.error(f"INVALID hedge_distance_pe {val}")
-
-                    elif val <= abs(merged.get("sell_shift_pe", merged.get("sell_shift", 100))):
-                        logging.error(f"hedge_distance_pe too small")
-
-                    else:
-                        merged["hedge_distance_pe"] = val
-
-
-            # ENABLE CHECK
-            if not merged.get("enabled", True):
+            if not merged_index.get("enabled", True):
                 continue
 
-            final[idx] = merged
+            merged_index["setups"] = [
+                s for s in merged_index["setups"] if s.get("enabled", True)
+            ]
 
-        CONFIG_CACHE=final
-        LAST_LOAD=time.time()
+            if not merged_index["setups"]:
+                continue
+
+            final[idx] = merged_index
+
+        CONFIG_CACHE = final
+        LAST_LOAD = time.time()
 
         return final
 
@@ -418,20 +611,8 @@ def load_indices_config():
         logging.error(f"DB FAIL → LOCAL CONFIG: {e}")
         return LOCAL_DEFAULT
 
-INDICES=load_indices_config()
 
-# ============================================================
-# LOT SIZES
-# ============================================================
-LOT_SIZES={
-    "SENSEX":20,
-    "NIFTY":65,
-    "FINNIFTY":60,
-    "BANKNIFTY":30,
-    "MIDCPNIFTY":120,
-    "NIFTYNXT50":25,
-    "BANKEX":30
-}
+INDICES = load_indices_config()
 
 # ============================================================
 # LOGGING
@@ -453,10 +634,9 @@ IST=pytz.timezone("Asia/Kolkata")
 def now_ist(): return datetime.now(IST)
 
 # ============================================================
-# FASTAPI
+# FASTAPI / LOCKS (app constructed after lifespan)
 # ============================================================
-app=FastAPI()
-locks=defaultdict(asyncio.Lock)
+locks = defaultdict(asyncio.Lock)
 
 # ============================================================
 # OPENALGO
@@ -483,22 +663,28 @@ product="NRML"
 # ============================================================
 os.makedirs("state",exist_ok=True)
 
-def state_file(i): return f"state/{i}.json"
+def load_state(index, setup_name):
 
-def load_state(i):
+    path = state_file(index, setup_name)
 
-    if os.path.exists(state_file(i)):
-        return json.load(open(state_file(i)))
+    if os.path.exists(path):
+        return json.load(open(path))
+
+    if setup_name == "DEFAULT":
+        legacy = f"state/{index}.json"
+        if os.path.exists(legacy):
+            return json.load(open(legacy))
 
     return {
-        "position_open":False,
-        "order_in_progress":False,
-        "last_trade_time":0,
-        "side":None
+        "position_open": False,
+        "order_in_progress": False,
+        "last_trade_time": 0,
+        "side": None,
     }
 
-def save_state(i,d):
-    json.dump(d,open(state_file(i),"w"))
+
+def save_state(index, setup_name, d):
+    json.dump(d, open(state_file(index, setup_name), "w"))
 
 # ============================================================
 # COOLDOWN
@@ -698,7 +884,7 @@ def get_nearest_expiry(index):
 # ============================================================
 # SYMBOL ENGINE — ATM REFERENCED
 # ============================================================
-def build_spread_symbols(index, price, signal, cfg):
+def build_spread_symbols(index, price, signal, index_cfg, cfg):
 
     interval = cfg["strike_interval"]
 
@@ -711,7 +897,7 @@ def build_spread_symbols(index, price, signal, cfg):
     if signal == "ce_sell":
         atm = ceil_strike(price, interval)
 
-        sell_strike  = atm + shift_ce
+        sell_strike = atm + shift_ce
         hedge_strike = atm + hedge_ce
 
         opt = "CE"
@@ -719,7 +905,7 @@ def build_spread_symbols(index, price, signal, cfg):
     elif signal == "pe_sell":
         atm = floor_strike(price, interval)
 
-        sell_strike  = atm - shift_pe
+        sell_strike = atm - shift_pe
         hedge_strike = atm - hedge_pe
 
         opt = "PE"
@@ -727,14 +913,15 @@ def build_spread_symbols(index, price, signal, cfg):
     else:
         raise ValueError(signal)
 
-    expiry = get_expiry(index)
+    expiry = resolve_sell_expiry(index, index_cfg)
 
-    sell_symbol  = f"{index}{expiry}{sell_strike}{opt}"
+    sell_symbol = f"{index}{expiry}{sell_strike}{opt}"
     hedge_symbol = f"{index}{expiry}{hedge_strike}{opt}"
 
     return sell_symbol, hedge_symbol
 
-def build_sell_symbol(index, price, signal, cfg):
+
+def build_sell_symbol(index, price, signal, index_cfg, cfg):
 
     if signal == "ce_sell":
         strike = ceil_strike(price, cfg["strike_interval"]) + cfg["sell_shift"]
@@ -747,7 +934,7 @@ def build_sell_symbol(index, price, signal, cfg):
     else:
         raise ValueError(signal)
 
-    return f"{index}{get_expiry(index)}{strike}{opt}"
+    return f"{index}{resolve_sell_expiry(index, index_cfg)}{strike}{opt}"
 
 def hedge_symbol(sym, dist):
 
@@ -761,7 +948,7 @@ def hedge_symbol(sym, dist):
 # ============================================================
 # BUY SYMBOL ENGINE — ATM + NEAREST EXPIRY
 # ============================================================
-def build_buy_symbol(index, price, signal, cfg):
+def build_buy_symbol(index, price, signal, index_cfg, cfg):
 
     interval = cfg["strike_interval"]
 
@@ -803,7 +990,7 @@ def place(action, symbol, index, cfg, strategy_type):
         else:
             lots = cfg.get("sell_lots", 1)
 
-        qty = lots * LOT_SIZES[index]
+        qty = lots * LOT_SIZE_MAP[index]
 
         logger.info(f"[START] {action} {symbol} | Strategy:{strategy_type}")
 
@@ -892,19 +1079,18 @@ def save_trade_to_db(trade_data):
     table.put_item(Item=trade_data)
 
 
-async def calculate_spread_pnl(trade, cfg):
-
+async def calculate_spread_pnl(trade, index_cfg):
 
     sell_quote = await asyncio.to_thread(
         client.quotes,
         symbol=trade["sell_symbol"],
-        exchange=cfg["exchange"]
+        exchange=index_cfg["exchange"],
     )
 
     hedge_quote = await asyncio.to_thread(
         client.quotes,
         symbol=trade["hedge_symbol"],
-        exchange=cfg["exchange"]
+        exchange=index_cfg["exchange"],
     )
 
 
@@ -928,13 +1114,12 @@ async def calculate_spread_pnl(trade, cfg):
 
     return total_pnl
 
-async def calculate_buy_pnl(trade, cfg):
+async def calculate_buy_pnl(trade, index_cfg):
 
     quote = await asyncio.to_thread(
         client.quotes,
         symbol=trade["symbol"],
-        exchange=cfg["exchange"]
-        
+        exchange=index_cfg["exchange"],
     )
 
     ltp = Decimal(str(quote["data"]["ltp"]))
@@ -1037,13 +1222,13 @@ async def pnl_monitor():
                     sell_quote = await asyncio.to_thread(
                         client.quotes,
                         symbol=trade["sell_symbol"],
-                        exchange=cfg["exchange"]
+                        exchange=cfg["exchange"],
                     )
 
                     hedge_quote = await asyncio.to_thread(
                         client.quotes,
                         symbol=trade["hedge_symbol"],
-                        exchange=cfg["exchange"]
+                        exchange=cfg["exchange"],
                     )
 
                     sell_ltp  = Decimal(str(sell_quote["data"]["ltp"]))
@@ -1068,7 +1253,7 @@ async def pnl_monitor():
                     quote = await asyncio.to_thread(
                         client.quotes,
                         symbol=trade["symbol"],
-                        exchange=cfg["exchange"]
+                        exchange=cfg["exchange"],
                     )
 
                     ltp   = Decimal(str(quote["data"]["ltp"]))
@@ -1270,11 +1455,13 @@ async def pnl_monitor():
                         # -----------------------------
                         # Close Position
                         # -----------------------------
+                        setup_nm = trade.get("setup_name", "DEFAULT")
+
                         if strategy == "sell_spread":
-                            await execute_sell_exit_internal(index)
+                            await execute_sell_exit_internal(index, setup_nm)
 
                         elif strategy == "buy":
-                            await execute_buy_exit(index)
+                            await execute_buy_exit(index, setup_nm)
 
                         # -----------------------------
                         # Update DB
@@ -1314,21 +1501,31 @@ async def pnl_monitor():
 
         await asyncio.sleep(45)
 
-async def execute_sell_exit_internal(index):
+async def execute_sell_exit_internal(index, setup_name="DEFAULT"):
 
     IND = load_indices_config()
-    cfg = IND[index]
-    st  = load_state(index)
+
+    if index not in IND:
+        return
+
+    index_cfg = IND[index]
+    setup = get_setup_by_name(index_cfg, setup_name)
+
+    if not setup:
+        return
+
+    exec_cfg = merged_exec_context(index_cfg, setup)
+    st = load_state(index, setup_name)
 
     if not st["position_open"]:
         return
 
-    place("BUY", st["sell"], index, cfg, "sell")
+    place("BUY", st["sell"], index, exec_cfg, "sell")
     time.sleep(0.5)
-    place("SELL", st["hedge"], index, cfg, "sell")
+    place("SELL", st["hedge"], index, exec_cfg, "sell")
 
     st["position_open"] = False
-    save_state(index, st)
+    save_state(index, setup_name, st)
 
 async def get_vix_value():
 
@@ -1354,23 +1551,30 @@ async def get_vix_value():
 # ============================================================
 # EXECUTION
 # ============================================================
-async def execute_sell(index, signal, price):
+async def execute_sell(index, signal, price, setup_name="DEFAULT"):
 
     IND = load_indices_config()
 
     if index not in IND:
         return {"status": "blocked"}
 
-    cfg = IND[index]
+    index_cfg = IND[index]
+    setup = get_setup_by_name(index_cfg, setup_name)
 
-    if not cfg.get("sell_enabled", True):
+    if not setup:
+        return {"status": "blocked", "reason": "unknown setup"}
+
+    if not setup.get("sell_enabled", True):
         return {"status": "blocked", "reason": "sell disabled"}
 
-    st = load_state(index)
+    exec_cfg = merged_exec_context(index_cfg, setup)
+    st = load_state(index, setup_name)
 
     new_side = "CE" if signal == "ce_sell" else "PE"
 
-    async with locks[index]:
+    lk = runtime_key(index, setup_name)
+
+    async with locks[lk]:
 
         if st["order_in_progress"]:
             return {"status": "rejected", "reason": "busy"}
@@ -1379,7 +1583,7 @@ async def execute_sell(index, signal, price):
             return {"status": "rejected", "reason": "cooldown"}
 
         st["order_in_progress"] = True
-        save_state(index, st)
+        save_state(index, setup_name, st)
 
         try:
 
@@ -1390,7 +1594,8 @@ async def execute_sell(index, signal, price):
                 index,
                 price,
                 signal,
-                cfg
+                index_cfg,
+                exec_cfg,
             )
 
             # ====================================================
@@ -1404,7 +1609,7 @@ async def execute_sell(index, signal, price):
                 if old_side == new_side:
                     return {
                         "status": "ignored",
-                        "reason": "same spread already open"
+                        "reason": "same spread already open",
                     }
 
                 print(f"🔄 SIDE SWITCH {old_side} → {new_side}", flush=True)
@@ -1412,13 +1617,13 @@ async def execute_sell(index, signal, price):
                 # ---------------------------------------
                 # CLOSE OLD POSITION FIRST
                 # ---------------------------------------
-                place("BUY", st["sell"], index, cfg, "sell")
+                place("BUY", st["sell"], index, exec_cfg, "sell")
                 time.sleep(0.5)
 
-                place("SELL", st["hedge"], index, cfg, "sell")
+                place("SELL", st["hedge"], index, exec_cfg, "sell")
 
                 st["position_open"] = False
-                save_state(index, st)
+                save_state(index, setup_name, st)
 
                 # ---------------------------------------
                 # CLOSE OLD DB TRADE
@@ -1427,22 +1632,23 @@ async def execute_sell(index, signal, price):
 
                 resp = await asyncio.to_thread(
                     table.query,
-                    KeyConditionExpression=Key("client_id").eq(CLIENT_ID)
+                    KeyConditionExpression=Key("client_id").eq(CLIENT_ID),
                 )
 
                 for trade in resp.get("Items", []):
 
                     if (
-                        trade["index"] == index and
-                        trade["strategy_type"] == "sell_spread" and
-                        trade["status"] == "OPEN"
+                        trade["index"] == index
+                        and trade.get("setup_name", "DEFAULT") == setup_name
+                        and trade["strategy_type"] == "sell_spread"
+                        and trade["status"] == "OPEN"
                     ):
 
                         await asyncio.to_thread(
                             table.update_item,
                             Key={
                                 "client_id": CLIENT_ID,
-                                "trade_id": trade["trade_id"]
+                                "trade_id": trade["trade_id"],
                             },
                             UpdateExpression="""
                                 SET #s = :closed,
@@ -1450,13 +1656,13 @@ async def execute_sell(index, signal, price):
                                     exit_reason = :r
                             """,
                             ExpressionAttributeNames={
-                                "#s": "status"
+                                "#s": "status",
                             },
                             ExpressionAttributeValues={
                                 ":closed": "CLOSED",
                                 ":t": int(time.time()),
-                                ":r": "SIDE_SWITCH"
-                            }
+                                ":r": "SIDE_SWITCH",
+                            },
                         )
 
             # ====================================================
@@ -1467,12 +1673,12 @@ async def execute_sell(index, signal, price):
             if vix_value is None:
                 return {"status": "blocked", "reason": "VIX unavailable"}
 
-            vix_threshold = cfg.get("vix_threshold", 30)
+            vix_threshold = index_cfg.get("vix_threshold", 30)
 
             if vix_value >= vix_threshold:
                 return {
                     "status": "blocked",
-                    "reason": f"VIX {vix_value} >= threshold {vix_threshold}"
+                    "reason": f"VIX {vix_value} >= threshold {vix_threshold}",
                 }
 
             print(f"✅ VIX OK → {vix_value}", flush=True)
@@ -1480,47 +1686,48 @@ async def execute_sell(index, signal, price):
             # ====================================================
             # OPEN NEW POSITION
             # ====================================================
-            place("BUY", new_hedge, index, cfg, "sell")
+            place("BUY", new_hedge, index, exec_cfg, "sell")
             time.sleep(0.5)
 
-            place("SELL", new_sell, index, cfg, "sell")
+            place("SELL", new_sell, index, exec_cfg, "sell")
 
             # ----------------------------------------------------
             # UPDATE STATE
             # ----------------------------------------------------
-            st.update({
-                "position_open": True,
-                "sell": new_sell,
-                "hedge": new_hedge,
-                "side": new_side,
-                "last_trade_time": time.time()
-            })
+            st.update(
+                {
+                    "position_open": True,
+                    "sell": new_sell,
+                    "hedge": new_hedge,
+                    "side": new_side,
+                    "last_trade_time": time.time(),
+                }
+            )
 
             # ----------------------------------------------------
             # FETCH ENTRY PRICES
             # ----------------------------------------------------
             sell_ltp = client.quotes(
                 symbol=new_sell,
-                exchange=cfg["exchange"]
+                exchange=exec_cfg["exchange"],
             )["data"]["ltp"]
 
             hedge_ltp = client.quotes(
                 symbol=new_hedge,
-                exchange=cfg["exchange"]
+                exchange=exec_cfg["exchange"],
             )["data"]["ltp"]
 
             # ----------------------------------------------------
             # TRADE METADATA
             # ----------------------------------------------------
-            trade_id = f"{index}_{int(time.time())}"
+            trade_id = f"{index}*{setup_name}*{int(time.time())}"
 
-            lot_size = LOT_SIZES[index]
-            lots = cfg.get("sell_lots", 1)
+            lot_size = LOT_SIZE_MAP[index]
+            lots = exec_cfg.get("sell_lots", 1)
             qty = lot_size * lots
 
             expected_profit = (
-                Decimal(str(sell_ltp))
-                - Decimal(str(hedge_ltp))
+                Decimal(str(sell_ltp)) - Decimal(str(hedge_ltp))
             ) * Decimal(qty)
 
             # ----------------------------------------------------
@@ -1531,6 +1738,7 @@ async def execute_sell(index, signal, price):
                 "client_id": CLIENT_ID,
                 "trade_id": trade_id,
                 "index": index,
+                "setup_name": setup_name,
                 "strategy_type": "sell_spread",
 
                 "sell_symbol": new_sell,
@@ -1547,7 +1755,7 @@ async def execute_sell(index, signal, price):
                 # PROFIT TARGET
                 # -----------------------------
                 "sell_target_percent": Decimal(
-                    str(cfg.get("sell_target_percent", 80))
+                    str(exec_cfg.get("sell_target_percent", 80))
                 ),
 
                 "expected_profit": expected_profit,
@@ -1556,79 +1764,87 @@ async def execute_sell(index, signal, price):
                 # PREMIUM TARGET
                 # -----------------------------
                 "sell_fixed_premium_points": Decimal(
-                    str(cfg.get("sell_fixed_premium_points", 0))
+                    str(exec_cfg.get("sell_fixed_premium_points", 0))
                 ),
 
                 # -----------------------------
                 # STOPLOSS
                 # -----------------------------
                 "sell_stoploss_percent": Decimal(
-                    str(cfg.get("sell_stoploss_percent", 0))
+                    str(exec_cfg.get("sell_stoploss_percent", 0))
                 ),
 
                 "sell_sl_premium_points": Decimal(
-                    str(cfg.get("sell_sl_premium_points", 0))
+                    str(exec_cfg.get("sell_sl_premium_points", 0))
                 ),
 
                 # -----------------------------
                 # EXIT FLAGS SNAPSHOT
                 # -----------------------------
-                "sell_percent_exit_enabled": cfg.get(
+                "sell_percent_exit_enabled": exec_cfg.get(
                     "sell_percent_exit_enabled", True
                 ),
 
-                "sell_fixed_exit_enabled": cfg.get(
+                "sell_fixed_exit_enabled": exec_cfg.get(
                     "sell_fixed_exit_enabled", True
                 ),
 
-                "sell_percent_sl_enabled": cfg.get(
+                "sell_percent_sl_enabled": exec_cfg.get(
                     "sell_percent_sl_enabled", False
                 ),
 
-                "sell_fixed_sl_enabled": cfg.get(
+                "sell_fixed_sl_enabled": exec_cfg.get(
                     "sell_fixed_sl_enabled", False
-                )     
+                ),
             }
 
             save_trade_to_db(trade_data)
 
-            save_state(index, st)
+            save_state(index, setup_name, st)
 
             return {"status": "success"}
 
         finally:
 
             st["order_in_progress"] = False
-            save_state(index, st)
+            save_state(index, setup_name, st)
 
 # ============================================================
 # EXECUTE BUY
 # ============================================================
-async def execute_buy(index, signal, price):
+async def execute_buy(index, signal, price, setup_name="DEFAULT"):
 
     IND = load_indices_config()
 
     if index not in IND:
-        return {"status":"blocked"}
+        return {"status": "blocked"}
 
-    cfg = IND[index]
-    if not cfg.get("buy_enabled", True):
+    index_cfg = IND[index]
+    setup = get_setup_by_name(index_cfg, setup_name)
+
+    if not setup:
+        return {"status": "blocked", "reason": "unknown setup"}
+
+    if not setup.get("buy_enabled", True):
         return {"status": "blocked", "reason": "buy disabled"}
 
-    st = load_state(index)
+    exec_cfg = merged_exec_context(index_cfg, setup)
+    st = load_state(index, setup_name)
 
     new_side = "CE" if signal == "ce_buy" else "PE"
 
-    async with locks[index]:
+    lk = runtime_key(index, setup_name)
+
+    async with locks[lk]:
 
         if st["order_in_progress"]:
-            return {"status":"rejected","reason":"busy"}
+            return {"status": "rejected", "reason": "busy"}
 
         if not cooldown_ok(st):
-            return {"status":"rejected","reason":"cooldown"}
+            return {"status": "rejected", "reason": "cooldown"}
 
         st["order_in_progress"] = True
-        save_state(index, st)
+        save_state(index, setup_name, st)
 
         try:
 
@@ -1641,8 +1857,8 @@ async def execute_buy(index, signal, price):
 
                 if old_side == new_side:
                     return {
-                        "status":"ignored",
-                        "reason":"same side already open"
+                        "status": "ignored",
+                        "reason": "same side already open",
                     }
 
                 # CLOSE OLD
@@ -1650,16 +1866,16 @@ async def execute_buy(index, signal, price):
                     "SELL",
                     st["buy_symbol"],
                     index,
-                    cfg,
-                    "buy"
+                    exec_cfg,
+                    "buy",
                 )
 
             # ====================================================
             # OPEN NEW
             # ====================================================
-            symbol = build_buy_symbol(index, price, signal, cfg)
+            symbol = build_buy_symbol(index, price, signal, index_cfg, exec_cfg)
 
-            place("BUY", symbol, index, cfg, "buy")
+            place("BUY", symbol, index, exec_cfg, "buy")
 
             # ---------------------------------------
             # Fetch entry price (LTP)
@@ -1667,7 +1883,7 @@ async def execute_buy(index, signal, price):
             quote = await asyncio.to_thread(
                 client.quotes,
                 symbol=symbol,
-                exchange=cfg["exchange"]
+                exchange=exec_cfg["exchange"],
             )
 
             entry_ltp = Decimal(str(quote["data"]["ltp"]))
@@ -1675,8 +1891,8 @@ async def execute_buy(index, signal, price):
             # ---------------------------------------
             # Quantity Calculation
             # ---------------------------------------
-            lot_size = LOT_SIZES[index]
-            lots = cfg.get("buy_lots", 1)
+            lot_size = LOT_SIZE_MAP[index]
+            lots = exec_cfg.get("buy_lots", 1)
             qty = lot_size * lots
 
             # ---------------------------------------
@@ -1685,12 +1901,13 @@ async def execute_buy(index, signal, price):
             # ---------------------------------------
             expected_profit = entry_ltp * Decimal(qty)
 
-            trade_id = f"{index}_BUY_{int(time.time())}"
+            trade_id = f"{index}*{setup_name}*{int(time.time())}"
 
             trade_data = {
                 "client_id": CLIENT_ID,
                 "trade_id": trade_id,
                 "index": index,
+                "setup_name": setup_name,
                 "strategy_type": "buy",
                 "symbol": symbol,
                 "entry": entry_ltp,
@@ -1702,88 +1919,97 @@ async def execute_buy(index, signal, price):
                 # PREMIUM TARGET
                 # ---------------------------------
                 "buy_fixed_premium_points": Decimal(
-                    str(cfg.get("buy_fixed_premium_points", 0))
+                    str(exec_cfg.get("buy_fixed_premium_points", 0))
                 ),
 
                 # ---------------------------------
                 # STOPLOSS
                 # ---------------------------------
                 "buy_target_percent": Decimal(
-                    str(cfg.get("buy_target_percent", 100))
+                    str(exec_cfg.get("buy_target_percent", 100))
                 ),
 
                 "buy_stoploss_percent": Decimal(
-                    str(cfg.get("buy_stoploss_percent", 50))
+                    str(exec_cfg.get("buy_stoploss_percent", 50))
                 ),
                 "buy_sl_premium_points": Decimal(
-                    str(cfg.get("buy_sl_premium_points", 0))
+                    str(exec_cfg.get("buy_sl_premium_points", 0))
                 ),
 
                 # ---------------------------------
                 # EXIT FLAGS
                 # ---------------------------------
-                "buy_percent_exit_enabled": cfg.get(
+                "buy_percent_exit_enabled": exec_cfg.get(
                     "buy_percent_exit_enabled", True
                 ),
 
-                "buy_fixed_exit_enabled": cfg.get(
+                "buy_fixed_exit_enabled": exec_cfg.get(
                     "buy_fixed_exit_enabled", False
                 ),
 
-                "buy_percent_sl_enabled": cfg.get(
+                "buy_percent_sl_enabled": exec_cfg.get(
                     "buy_percent_sl_enabled", False
                 ),
 
-                "buy_fixed_sl_enabled": cfg.get(
+                "buy_fixed_sl_enabled": exec_cfg.get(
                     "buy_fixed_sl_enabled", False
-                )                
+                ),
             }
 
             save_trade_to_db(trade_data)
 
+            st.update(
+                {
+                    "buy_position_open": True,
+                    "buy_symbol": symbol,
+                    "buy_side": new_side,
+                    "last_trade_time": time.time(),
+                    "active_buy_trade_id": trade_id,
+                }
+            )
 
-            st.update({
-                "buy_position_open": True,
-                "buy_symbol": symbol,
-                "buy_side": new_side,
-                "last_trade_time": time.time(),
-                "active_buy_trade_id": trade_id
-            })
+            save_state(index, setup_name, st)
 
-            save_state(index, st)
-
-            return {"status":"success","symbol":symbol}
+            return {"status": "success", "symbol": symbol}
 
         finally:
             st["order_in_progress"] = False
-            save_state(index, st)
+            save_state(index, setup_name, st)
 # ============================================================
 # EXECUTE BUY EXIT
 # ============================================================
-async def execute_buy_exit(index):
+async def execute_buy_exit(index, setup_name="DEFAULT"):
 
     IND = load_indices_config()
 
     if index not in IND:
-        return {"status":"disabled"}
+        return {"status": "disabled"}
 
-    cfg = IND[index]
-    st  = load_state(index)
+    index_cfg = IND[index]
+    setup = get_setup_by_name(index_cfg, setup_name)
 
-    async with locks[index]:
+    if not setup:
+        return {"status": "disabled"}
+
+    exec_cfg = merged_exec_context(index_cfg, setup)
+    st = load_state(index, setup_name)
+
+    lk = runtime_key(index, setup_name)
+
+    async with locks[lk]:
 
         # ---------- POSITION CHECK ----------
         if not st.get("buy_position_open"):
-            return {"status":"no buy position"}
+            return {"status": "no buy position"}
 
         # ---------- EXIT ORDER ----------
-        place("SELL", st["buy_symbol"], index, cfg,"buy")
+        place("SELL", st["buy_symbol"], index, exec_cfg, "buy")
 
         # ---------- UPDATE STATE ----------
         st["buy_position_open"] = False
-        save_state(index, st)
+        save_state(index, setup_name, st)
 
-    return {"status":"buy closed"}
+    return {"status": "buy closed"}
 
 def extract_expiry_from_symbol(index, symbol):
     """
@@ -1795,9 +2021,9 @@ def extract_expiry_from_symbol(index, symbol):
 
 
 
-def validate_state_expiry(index):
+def validate_state_expiry(index, setup_name="DEFAULT"):
 
-    st = load_state(index)
+    st = load_state(index, setup_name)
     today = now_ist().date()
 
     table = dynamodb.Table("ClientTrades")
@@ -1813,7 +2039,10 @@ def validate_state_expiry(index):
 
             if today > expiry_date:
 
-                print(f"⚠️ SELL expired for {index}. Closing state + DB.", flush=True)
+                print(
+                    f"⚠️ SELL expired for {index} [{setup_name}]. Closing state + DB.",
+                    flush=True,
+                )
 
                 # -------- Reset Local State --------
                 st["position_open"] = False
@@ -1824,15 +2053,16 @@ def validate_state_expiry(index):
 
                 # -------- Close DB Trades --------
                 resp = table.query(
-                    KeyConditionExpression=Key("client_id").eq(CLIENT_ID)
+                    KeyConditionExpression=Key("client_id").eq(CLIENT_ID),
                 )
 
                 for trade in resp.get("Items", []):
 
                     if (
-                        trade.get("index") == index and
-                        trade.get("strategy_type") == "sell_spread" and
-                        trade.get("status") == "OPEN"
+                        trade.get("index") == index
+                        and trade.get("setup_name", "DEFAULT") == setup_name
+                        and trade.get("strategy_type") == "sell_spread"
+                        and trade.get("status") == "OPEN"
                     ):
 
                         table.update_item(
@@ -1870,7 +2100,10 @@ def validate_state_expiry(index):
 
             if today > expiry_date:
 
-                print(f"⚠️ BUY expired for {index}. Closing state + DB.", flush=True)
+                print(
+                    f"⚠️ BUY expired for {index} [{setup_name}]. Closing state + DB.",
+                    flush=True,
+                )
 
                 # -------- Reset Local State --------
                 st["buy_position_open"] = False
@@ -1880,15 +2113,16 @@ def validate_state_expiry(index):
 
                 # -------- Close DB Trades --------
                 resp = table.query(
-                    KeyConditionExpression=Key("client_id").eq(CLIENT_ID)
+                    KeyConditionExpression=Key("client_id").eq(CLIENT_ID),
                 )
 
                 for trade in resp.get("Items", []):
 
                     if (
-                        trade.get("index") == index and
-                        trade.get("strategy_type") == "buy" and
-                        trade.get("status") == "OPEN"
+                        trade.get("index") == index
+                        and trade.get("setup_name", "DEFAULT") == setup_name
+                        and trade.get("strategy_type") == "buy"
+                        and trade.get("status") == "OPEN"
                     ):
 
                         table.update_item(
@@ -1917,7 +2151,7 @@ def validate_state_expiry(index):
             print(f"🔥 BUY expiry validation error: {e}", flush=True)
 
     if changed:
-        save_state(index, st)
+        save_state(index, setup_name, st)
 
 async def daily_expiry_validator():
 
@@ -1935,8 +2169,8 @@ async def daily_expiry_validator():
 
             print("⏰ Running expiry validation...", flush=True)
 
-            for idx in load_indices_config().keys():
-                validate_state_expiry(idx)
+            for idx, setup_name, _, _ in iter_index_setup_pairs(load_indices_config()):
+                validate_state_expiry(idx, setup_name)
 
             last_run_date = now.date()
 
@@ -1948,8 +2182,8 @@ async def lifespan(app: FastAPI):
     print("🚀 Starting Services...")
 
     # Run once at startup (safety)
-    for idx in load_indices_config().keys():
-        validate_state_expiry(idx)
+    for idx, setup_name, _, _ in iter_index_setup_pairs(load_indices_config()):
+        validate_state_expiry(idx, setup_name)
 
     # Start background services
     asyncio.create_task(pnl_monitor())
@@ -1974,7 +2208,8 @@ async def sell(req: Request):
     return await execute_sell(
         d["index"],
         d["signal"],
-        float(d["price"])
+        float(d["price"]),
+        d.get("setup_name", "DEFAULT"),
     )
 
 # ============================================================
@@ -1987,47 +2222,55 @@ async def exit_trade(req: Request):
     validate_passkey(d)
 
     index = d["index"]
+    setup_name = d.get("setup_name", "DEFAULT")
 
     IND = load_indices_config()
     if index not in IND:
         return {"status": "disabled"}
 
-    cfg = IND[index]
-    st = load_state(index)
+    index_cfg = IND[index]
+    setup = get_setup_by_name(index_cfg, setup_name)
+    if not setup:
+        return {"status": "disabled"}
 
-    async with locks[index]:
+    exec_cfg = merged_exec_context(index_cfg, setup)
+    st = load_state(index, setup_name)
+
+    async with locks[runtime_key(index, setup_name)]:
 
         if not st["position_open"]:
             return {"status": "no position"}
 
         # Exit orders
-        place("BUY", st["sell"], index, cfg, "sell")
-        time.sleep(0.5)    
-        place("SELL", st["hedge"], index, cfg, "sell")
+        place("BUY", st["sell"], index, exec_cfg, "sell")
+        time.sleep(0.5)
+        place("SELL", st["hedge"], index, exec_cfg, "sell")
 
         st["position_open"] = False
-        save_state(index, st)
+        save_state(index, setup_name, st)
 
         # 🔥 UPDATE DYNAMODB
         table = dynamodb.Table("ClientTrades")
 
         resp = table.query(
-            KeyConditionExpression=Key("client_id").eq(CLIENT_ID)
+            KeyConditionExpression=Key("client_id").eq(CLIENT_ID),
         )
 
         for trade in resp.get("Items", []):
             if (
-                trade["index"] == index and
-                trade["status"] == "OPEN"
+                trade["index"] == index
+                and trade.get("setup_name", "DEFAULT") == setup_name
+                and trade["status"] == "OPEN"
+                and trade.get("strategy_type") == "sell_spread"
             ):
                 table.update_item(
                     Key={
                         "client_id": CLIENT_ID,
-                        "trade_id": trade["trade_id"]
+                        "trade_id": trade["trade_id"],
                     },
                     UpdateExpression="SET #s = :val",
                     ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={":val": "CLOSED"}
+                    ExpressionAttributeValues={":val": "CLOSED"},
                 )
 
     return {"status": "closed"}
@@ -2044,7 +2287,8 @@ async def buy(req: Request):
     return await execute_buy(
         d["index"],
         d["signal"],
-        float(d["price"])
+        float(d["price"]),
+        d.get("setup_name", "DEFAULT"),
     )
 
 # ============================================================
@@ -2057,27 +2301,33 @@ async def buy_exit(req: Request):
     validate_passkey(d)
 
     index = d["index"]
+    setup_name = d.get("setup_name", "DEFAULT")
 
     IND = load_indices_config()
 
     if index not in IND:
-        return {"status":"disabled"}
+        return {"status": "disabled"}
 
-    cfg = IND[index]
-    st  = load_state(index)
+    index_cfg = IND[index]
+    setup = get_setup_by_name(index_cfg, setup_name)
+    if not setup:
+        return {"status": "disabled"}
 
-    async with locks[index]:
+    exec_cfg = merged_exec_context(index_cfg, setup)
+    st = load_state(index, setup_name)
+
+    async with locks[runtime_key(index, setup_name)]:
 
         if not st.get("buy_position_open"):
-            return {"status":"no buy position"}
+            return {"status": "no buy position"}
 
         # Exit BUY → SELL same symbol
-        place("SELL", st["buy_symbol"], index, cfg,"buy")
+        place("SELL", st["buy_symbol"], index, exec_cfg, "buy")
 
         st["buy_position_open"] = False
-        save_state(index, st)
+        save_state(index, setup_name, st)
 
-    return {"status":"buy closed"}
+    return {"status": "buy closed"}
 
 # ============================================================
 
